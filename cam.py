@@ -6,8 +6,10 @@ from ultralytics import YOLO
 def start_mjpg_streamer():
     command = [
         'mjpg_streamer',
-        '-i', 'input_uvc.so -d /dev/video0 -fps 60 -r 1280x720',
-        '-o', 'output_http.so -w /usr/local/share/mjpg-streamer/www -p 8080'
+        '-i', 'input_uvc.so', '-d', '/dev/video0',
+        '-fps', '60', '-r', '1280x720',
+        '-o', 'output_http.so', '-w', '/usr/local/share/mjpg-streamer/www',
+        '-p', '8080'
     ]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return process
@@ -15,19 +17,21 @@ def start_mjpg_streamer():
 def main():
     # Start mjpg_streamer
     mjpg_process = start_mjpg_streamer()
-    
-    # Wait for mjpg_streamer to initialize
-    # time.sleep(5)
-    
-    # Read the video stream
+    time.sleep(5)  # 等待 mjpg_streamer 初始化
+
     stream_url = 'http://localhost:8080/?action=stream'
-    cap = cv2.VideoCapture(stream_url)
-    
-    if not cap.isOpened():
+    # 嘗試重試開啟串流
+    cap = None
+    for _ in range(5):
+        cap = cv2.VideoCapture(stream_url)
+        if cap.isOpened():
+            break
+        time.sleep(1)
+    if not cap or not cap.isOpened():
         print("無法開啟影像流")
         mjpg_process.terminate()
         return
-    
+
     # Load the YOLOv12 model
     try:
         model = YOLO('yolo11n.pt')  # Ensure the path is correct
