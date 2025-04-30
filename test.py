@@ -26,7 +26,7 @@ def parse_args():
                         help='物體偵測信心閾值')
     parser.add_argument('--output-dir', type=str, default='./output', 
                         help='輸出圖片的儲存目錄')
-    parser.add_argument('--save-interval', type=int, default=30,
+    parser.add_argument('--save-interval', type=int, default=0,
                         help='每 N 個畫面儲存一張偵測結果圖片 (設為 0 停用)')
     parser.add_argument('--save-latest', action='store_true',
                         help='持續更新最新偵測結果圖片')
