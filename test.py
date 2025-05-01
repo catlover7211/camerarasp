@@ -36,7 +36,7 @@ def parse_args():
                         help='相機裝置路徑')
     parser.add_argument('--resolution', type=str, default='1280x720',
                         help='相機解析度')
-    parser.add_argument('--fps', type=int, default=60,
+    parser.add_argument('--fps', type=int, default=30,
                         help='相機幀率')
     parser.add_argument('--port', type=int, default=8080,
                         help='MJPG-Streamer 伺服器埠')
