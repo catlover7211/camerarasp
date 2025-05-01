@@ -44,6 +44,14 @@ def parse_args():
                         help='Flask 網頁服務器埠')
     parser.add_argument('--web-interface', action='store_true', default=True,
                         help='啟用網頁界面')
+    parser.add_argument('--img-size', type=int, default=320, 
+                        help='模型輸入圖像尺寸，較小尺寸將加快處理速度')
+    parser.add_argument('--skip-frames', type=int, default=0, 
+                        help='每隔N幀處理一次，0表示處理每一幀')
+    parser.add_argument('--optimize', action='store_true', default=True,
+                        help='啟用額外優化以提高速度')
+    parser.add_argument('--quiet', action='store_true', default=True,
+                        help='抑制模型偵測的詳細輸出')
     return parser.parse_args()
 
 def is_process_running(process_name):
@@ -107,8 +115,22 @@ def load_yolo_model(model_path):
     try:
         # 試著使用 ultralytics API (假設 YOLOv11 使用相同 API)
         from ultralytics import YOLO
+        
+        # 抑制 ultralytics 的詳細訊息
+        import logging
+        logging.getLogger("ultralytics").setLevel(logging.WARNING)
+        
         model = YOLO(model_path)
         print("成功使用 ultralytics API 載入 YOLOv11 模型")
+        
+        # 嘗試啟用模型優化
+        try:
+            # 對於 PyTorch 模型，設置為推理模式
+            model.model.eval()
+            print("模型已設置為推理模式")
+        except:
+            print("無法設置模型為推理模式，繼續使用默認設定")
+            
         return model, "ultralytics"
     except ImportError:
         try:
@@ -189,6 +211,74 @@ def run_flask_app(port=5000):
     """在單獨的線程中運行Flask應用"""
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
 
+def draw_boxes_on_image(image, results, names, resize_ratio=(1.0, 1.0)):
+    """
+    在原始圖像上手動繪製邊界框
+    
+    Args:
+        image: 原始圖像
+        results: YOLO 檢測結果
+        names: 類別名稱
+        resize_ratio: 縮放比例 (x_ratio, y_ratio)
+    
+    Returns:
+        加入邊界框的圖像
+    """
+    annotated_image = image.copy()
+    
+    # 獲取檢測框
+    if hasattr(results[0], 'boxes'):
+        boxes = results[0].boxes
+        
+        # 繪製每個邊界框
+        for i in range(len(boxes)):
+            # 獲取邊界框座標
+            box = boxes[i].xyxy[0].cpu().numpy()  # 確保座標是 numpy 數組
+            x1, y1, x2, y2 = box
+            
+            # 調整比例
+            x1 = int(x1 * resize_ratio[0])
+            x2 = int(x2 * resize_ratio[0])
+            y1 = int(y1 * resize_ratio[1])
+            y2 = int(y2 * resize_ratio[1])
+            
+            # 獲取類別和信心度
+            cls_id = int(boxes[i].cls[0].item())
+            conf = float(boxes[i].conf[0].item())
+            
+            # 繪製邊界框
+            color = (0, 255, 0)  # 綠色
+            cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, 2)
+            
+            # 繪製標籤
+            label = f"{names[cls_id]} {conf:.2f}"
+            (text_width, text_height), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2
+            )
+            
+            # 確保標籤在圖像範圍內
+            label_y = max(y1, text_height + 10)
+            
+            # 繪製背景和文字
+            cv2.rectangle(
+                annotated_image, 
+                (x1, label_y - text_height - baseline), 
+                (x1 + text_width, label_y),
+                color, 
+                -1
+            )
+            cv2.putText(
+                annotated_image, 
+                label, 
+                (x1, label_y - baseline),
+                cv2.FONT_HERSHEY_SIMPLEX, 
+                0.5, 
+                (0, 0, 0), 
+                2
+            )
+    
+    return annotated_image
+
 def main():
     args = parse_args()
     
@@ -221,6 +311,12 @@ def main():
         print(f"載入模型時發生錯誤: {e}")
         return
     
+    # 啟用 OpenCV 優化
+    if args.optimize:
+        print("啟用 OpenCV 優化...")
+        cv2.setUseOptimized(True)
+        print(f"OpenCV 硬體加速已啟用: {cv2.useOptimized()}")
+    
     # 如果啟用網頁界面，在背景執行Flask服務器
     if args.web_interface:
         print(f"啟動網頁界面，訪問 http://[您的IP地址]:{args.flask_port} 查看即時偵測結果")
@@ -239,8 +335,10 @@ def main():
     print("連接成功。開始物件偵測...")
     
     frame_count = 0
+    processed_count = 0
     start_time = time.time()
     fps = 0
+    skip_frame_counter = 0
     
     global latest_frame  # 引用全局變量
     
@@ -252,36 +350,93 @@ def main():
                 time.sleep(1)  # 等待後重試
                 continue
             
+            frame_count += 1
+            
+            # 跳幀處理 - 如果啟用了跳幀且不是處理幀，則跳過偵測
+            if args.skip_frames > 0:
+                if skip_frame_counter < args.skip_frames:
+                    skip_frame_counter += 1
+                    with frame_lock:
+                        latest_frame = frame.copy()
+                    continue
+                skip_frame_counter = 0
+            
+            # 縮放圖像以加速處理，保持原始寬高比
+            original_shape = frame.shape
+            if args.optimize and args.img_size < frame.shape[1]:
+                # 根據長寬比計算新尺寸
+                h, w = frame.shape[:2]
+                
+                # 計算縮放因子，較小的尺寸縮放到目標大小
+                scale = min(args.img_size / w, args.img_size / h)
+                new_width = int(w * scale)
+                new_height = int(h * scale)
+                
+                # 縮放圖像
+                resized_frame = cv2.resize(frame, (new_width, new_height), 
+                                          interpolation=cv2.INTER_AREA)
+                
+                # 儲存縮放比例 (原始/縮放後)
+                resize_ratio = (w / new_width, h / new_height)
+            else:
+                resized_frame = frame
+                resize_ratio = (1.0, 1.0)
+            
             # 執行物件偵測
             try:
-                if api_type == "ultralytics":
-                    results = model(frame, conf=args.conf_thres)
-                    # 在畫面上繪製偵測結果
-                    annotated_frame = results[0].plot()
-                else:  # api_type == "native"
-                    # 請根據 YOLOv11 實際 API 進行調整
-                    results = model.detect(frame, conf_threshold=args.conf_thres)
-                    annotated_frame = model.draw_detections(frame, results)
+                detection_start = time.time()
                 
-                # 在畫面上加入 FPS 資訊
+                if api_type == "ultralytics":
+                    # 使用指定的圖像尺寸進行推理，並抑制詳細輸出
+                    results = model(resized_frame, conf=args.conf_thres, verbose=False)
+                    
+                    # 計算偵測時間
+                    detection_time = time.time() - detection_start
+                    
+                    # 根據是否縮放圖像來處理偵測結果
+                    if args.optimize and args.img_size < original_shape[1]:
+                        # 使用自定義函數在原始圖像上繪製邊界框
+                        annotated_frame = draw_boxes_on_image(
+                            frame, 
+                            results, 
+                            results[0].names, 
+                            resize_ratio
+                        )
+                    else:
+                        # 直接使用模型輸出的繪製結果
+                        annotated_frame = results[0].plot()
+                
+                # 修正 FPS 顯示
+                if processed_count % 5 == 0:
+                    end_time = time.time()
+                    time_diff = end_time - start_time
+                    if time_diff > 0:
+                        fps = 5 / time_diff
+                    start_time = end_time
+                    if args.quiet:  # 只在安靜模式下顯示簡潔的處理速度
+                        print(f"處理速度: {fps:.2f} FPS")
+                    else:
+                        print(f"處理速度: {fps:.2f} FPS, 偵測時間: {detection_time*1000:.0f}ms")
+                
+                # 在畫面上加入 FPS 和偵測時間
                 cv2.putText(annotated_frame, f"FPS: {fps:.2f}", (10, 30), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.putText(annotated_frame, f"Speed: {detection_time*1000:.0f}ms", (10, 60), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                
+                processed_count += 1
+                
             except Exception as e:
                 print(f"偵測過程中發生錯誤: {e}")
                 annotated_frame = frame
                 # 加入錯誤文字
-                cv2.putText(annotated_frame, "偵測錯誤", (10, 30), 
+                cv2.putText(annotated_frame, "ERROR", (10, 30), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             
-            # 計算 FPS
-            frame_count += 1
-            if frame_count % 10 == 0:
-                end_time = time.time()
-                time_diff = end_time - start_time
-                fps = 10 / time_diff if time_diff > 0 else 0
-                start_time = end_time
-                print(f"處理速度: {fps:.2f} FPS")
-            
+            # 更新全局變量以供Flask使用
+            with frame_lock:
+                latest_frame = annotated_frame.copy()
+                
             # 依指定間隔儲存畫面
             if args.save_interval > 0 and frame_count % args.save_interval == 0:
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -294,10 +449,6 @@ def main():
                 latest_path = output_dir / "latest_detection.jpg"
                 cv2.imwrite(str(latest_path), annotated_frame)
             
-            # 更新全局變量以供Flask使用
-            with frame_lock:
-                latest_frame = annotated_frame.copy()
-                
             # 短暫延遲以控制 CPU 使用率
             time.sleep(0.01)
             
@@ -307,12 +458,34 @@ def main():
         print(f"發生未預期錯誤: {e}")
     finally:
         cap.release()
+        
+        # 停止 MJPG-Streamer (如果是我們啟動的)
+        if not args.no_streamer and is_process_running('mjpg_streamer'):
+            try:
+                # 嘗試優雅地結束進程
+                mjpg_process = subprocess.run(['pkill', 'mjpg_streamer'], 
+                                             stdout=subprocess.PIPE, 
+                                             stderr=subprocess.PIPE)
+                print("已關閉 MJPG-Streamer")
+            except Exception as e:
+                print(f"關閉 MJPG-Streamer 時發生錯誤: {e}")
+        
         print("串流已關閉")
 
 # 程式結束時的清理函數
 def cleanup(*args):
     print("\n正在結束程式...")
-    # 可以在這裡添加關閉 mjpg-streamer 的代碼，如果需要的話
+    
+    # 嘗試停止 MJPG-Streamer
+    if is_process_running('mjpg_streamer'):
+        try:
+            subprocess.run(['pkill', 'mjpg_streamer'], 
+                          stdout=subprocess.PIPE, 
+                          stderr=subprocess.PIPE)
+            print("已關閉 MJPG-Streamer")
+        except:
+            pass
+    
     sys.exit(0)
 
 if __name__ == "__main__":
