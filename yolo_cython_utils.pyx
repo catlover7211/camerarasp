@@ -9,26 +9,35 @@
 import numpy as np
 cimport numpy as np
 import cv2
+import requests
+import time
+from urllib.parse import urlparse
 
 # 必須初始化 numpy C API
 np.import_array()
 
-# 定義 C 類型，提高效能 - 使用具體的類型而非通用類型
+# 定義 C 類型，提高效能
 ctypedef np.int32_t DTYPE_int
 ctypedef np.float32_t DTYPE_float
 ctypedef np.uint8_t DTYPE_uint8
 
+cdef inline float min_float(float a, float b) nogil:
+    """內聯函數：返回兩個浮點數中較小的一個"""
+    return a if a < b else b
+
+cdef inline int max_int(int a, int b) nogil:
+    """內聯函數：返回兩個整數中較大的一個"""
+    return a if a > b else b
+
 def resize_image(np.ndarray[DTYPE_uint8, ndim=3] image, int target_size):
-    """
-    高效能的圖像縮放，保持原始長寬比
-    """
+    """高效能的圖像縮放，保持原始長寬比"""
     cdef int h = image.shape[0]
     cdef int w = image.shape[1]
     cdef float scale_w = <float>target_size / <float>w
     cdef float scale_h = <float>target_size / <float>h
     
-    # 手動計算較小的縮放比例
-    cdef float scale = scale_w if scale_w < scale_h else scale_h
+    # 使用自定義內聯函數計算較小的縮放比例
+    cdef float scale = min_float(scale_w, scale_h)
     
     cdef int new_width = <int>(w * scale)
     cdef int new_height = <int>(h * scale)
@@ -40,20 +49,7 @@ def resize_image(np.ndarray[DTYPE_uint8, ndim=3] image, int target_size):
     return resized_frame, (<float>w / <float>new_width, <float>h / <float>new_height)
 
 def draw_boxes(np.ndarray[DTYPE_uint8, ndim=3] image, list boxes, list cls_ids, list confidences, dict names, tuple resize_ratio=(1.0, 1.0)):
-    """
-    高效繪製邊界框
-    
-    Args:
-        image: 原始圖像 (numpy 數組)
-        boxes: 邊界框座標 [x1, y1, x2, y2]
-        cls_ids: 類別 ID
-        confidences: 信心度 
-        names: 類別名稱
-        resize_ratio: 縮放比例 (x_ratio, y_ratio)
-    
-    Returns:
-        加入邊界框的圖像
-    """
+    """高效繪製邊界框"""
     cdef np.ndarray[DTYPE_uint8, ndim=3] annotated_image = image.copy()
     cdef int i, x1, y1, x2, y2, cls_id, text_width, text_height, baseline
     cdef int label_y, height_plus_10
@@ -64,39 +60,26 @@ def draw_boxes(np.ndarray[DTYPE_uint8, ndim=3] image, list boxes, list cls_ids, 
     cdef tuple color = (0, 255, 0)  # 綠色
     cdef str label
     
-    # 循環處理每個邊界框 (C 風格循環)
     for i in range(n_boxes):
-        # 獲取座標並調整比例
         x1 = <int>(boxes[i][0] * x_ratio)
         y1 = <int>(boxes[i][1] * y_ratio)
         x2 = <int>(boxes[i][2] * x_ratio)
         y2 = <int>(boxes[i][3] * y_ratio)
         
-        # 獲取類別和信心度
         cls_id = cls_ids[i]
         conf = confidences[i]
         
-        # 繪製邊界框
-        cv2.rectangle(annotated_image, 
-                     (x1, y1), 
-                     (x2, y2), 
-                     color, 2)
+        cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, 2)
         
-        # 繪製標籤
         label = f"{names[cls_id]} {conf:.2f}"
         text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
         text_width = text_size[0][0]
         text_height = text_size[0][1]
         baseline = text_size[1]
         
-        # 確保標籤在圖像範圍內 (手動實現 max 函數)
         height_plus_10 = text_height + 10
-        if y1 > height_plus_10:
-            label_y = y1
-        else:
-            label_y = height_plus_10
+        label_y = max_int(y1, height_plus_10)
         
-        # 繪製背景和文字
         cv2.rectangle(
             annotated_image, 
             (x1, label_y - text_height - baseline), 
@@ -116,10 +99,8 @@ def draw_boxes(np.ndarray[DTYPE_uint8, ndim=3] image, list boxes, list cls_ids, 
     
     return annotated_image
 
-def extract_detection_data(result):
-    """
-    從 YOLO 結果中提取檢測資料
-    """
+def extract_detection_data(object result):
+    """從 YOLO 結果中提取檢測資料"""
     cdef list boxes = []
     cdef list cls_ids = []
     cdef list confidences = []
@@ -131,7 +112,6 @@ def extract_detection_data(result):
             n_boxes = len(boxes_obj)
             
             for i in range(n_boxes):
-                # 獲取並轉換為普通 Python 列表以避免 PyTorch 張量問題
                 box = boxes_obj[i].xyxy[0].cpu().numpy().tolist()
                 boxes.append(box)
                 cls_ids.append(int(boxes_obj[i].cls[0].item()))
@@ -141,12 +121,35 @@ def extract_detection_data(result):
     
     return boxes, cls_ids, confidences
 
-# Cython 加速的 FPS 計算函數
 def calculate_fps(int frame_count, float time_diff):
-    """
-    計算 FPS (Frames Per Second)
-    """
+    """計算 FPS (Frames Per Second)"""
     cdef float fps = 0.0
-    if time_diff > 0.001:  # 避免除以接近零的值
+    if time_diff > 0.001:
         fps = <float>frame_count / time_diff
     return fps
+
+# 移除有問題的 MjpegStreamReader 類和相關函數
+# 改為提供更簡單、更穩定的工具函數
+
+def fix_mjpeg_url(str url):
+    """修正 MJPEG 流 URL 以提高穩定性"""
+    if "?action=stream" in url:
+        return url.replace("?action=stream", "?action=snapshot")
+    return url
+
+def get_single_jpeg_frame(str url, float timeout=2.0):
+    """獲取單幀 JPEG 圖像，避開流解碼問題"""
+    cdef np.ndarray frame = None
+    cdef bytes content
+    
+    try:
+        response = requests.get(url, timeout=timeout)
+        if response.status_code == 200:
+            content = response.content
+            # 使用 OpenCV 解碼 JPEG 圖像
+            buffer = np.frombuffer(content, dtype=np.uint8)
+            frame = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+    except Exception as e:
+        print(f"獲取圖像時發生錯誤: {e}")
+    
+    return frame

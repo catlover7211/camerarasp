@@ -11,6 +11,43 @@ from pathlib import Path
 import threading
 from flask import Flask, Response, render_template
 import io
+import traceback
+
+# 重定向 stderr 以抑制 OpenCV 的錯誤訊息
+class SuppressOutput:
+    def __init__(self, suppress_stderr=True, suppress_stdout=False):
+        self.suppress_stderr = suppress_stderr
+        self.suppress_stdout = suppress_stdout
+        self._stderr = None
+        self._stdout = None
+
+    def __enter__(self):
+        if self.suppress_stderr:
+            self._stderr = sys.stderr
+            sys.stderr = open(os.devnull, 'w')
+        if self.suppress_stdout:
+            self._stdout = sys.stdout
+            sys.stdout = open(os.devnull, 'w')
+
+    def __exit__(self, *args):
+        if self.suppress_stderr and self._stderr:
+            sys.stderr.close()
+            sys.stderr = self._stderr
+        if self.suppress_stdout and self._stdout:
+            sys.stdout.close()
+            sys.stdout = self._stdout
+
+# 抑制 OpenCV 錯誤訊息
+cv2_error_suppress = SuppressOutput(suppress_stderr=True)
+
+# 導入 Cython 優化模組
+try:
+    import yolo_cython_utils
+    USE_CYTHON = True
+    print("成功載入 Cython 加速模組")
+except ImportError:
+    USE_CYTHON = False
+    print("警告：無法載入 Cython 加速模組，使用純 Python 模式運行")
 
 # 全局變數，用於存儲最新的處理後畫面
 latest_frame = None
@@ -57,7 +94,6 @@ def parse_args():
 def is_process_running(process_name):
     """檢查指定程序是否正在運行"""
     try:
-        # 使用 ps 命令檢查進程
         output = subprocess.check_output(['ps', 'aux']).decode('utf-8')
         return process_name in output
     except subprocess.SubprocessError:
@@ -76,15 +112,10 @@ def start_mjpg_streamer(device='/dev/video0', resolution='1280x720', fps=60, por
     ]
     
     try:
-        # 使用 Popen 運行命令並讓它在背景執行
         streamer_process = subprocess.Popen(command, 
                                            stdout=subprocess.PIPE, 
                                            stderr=subprocess.PIPE)
-        
-        # 給 MJPG-Streamer 一些時間啟動
         time.sleep(2)
-        
-        # 檢查進程是否仍在運行
         if streamer_process.poll() is None:
             print(f"成功啟動 MJPG-Streamer，PID: {streamer_process.pid}")
             return True
@@ -113,28 +144,19 @@ def test_stream_connection(url, timeout=5):
 def load_yolo_model(model_path):
     """載入 YOLOv11 模型"""
     try:
-        # 試著使用 ultralytics API (假設 YOLOv11 使用相同 API)
         from ultralytics import YOLO
-        
-        # 抑制 ultralytics 的詳細訊息
         import logging
         logging.getLogger("ultralytics").setLevel(logging.WARNING)
-        
         model = YOLO(model_path)
         print("成功使用 ultralytics API 載入 YOLOv11 模型")
-        
-        # 嘗試啟用模型優化
         try:
-            # 對於 PyTorch 模型，設置為推理模式
             model.model.eval()
             print("模型已設置為推理模式")
         except:
             print("無法設置模型為推理模式，繼續使用默認設定")
-            
         return model, "ultralytics"
     except ImportError:
         try:
-            # 如果 ultralytics 不可用，嘗試直接導入 yolov11
             import yolov11
             model = yolov11.load(model_path)
             print("成功使用 yolov11 模組載入模型")
@@ -142,7 +164,6 @@ def load_yolo_model(model_path):
         except ImportError:
             raise ImportError("無法導入 YOLOv11。請安裝所需套件。")
 
-# 創建Flask應用
 app = Flask(__name__)
 
 @app.route('/')
@@ -193,18 +214,12 @@ def generate_frames():
     """生成視頻流的幀"""
     global latest_frame
     while True:
-        # 獲取最新的處理後畫面
         with frame_lock:
             if latest_frame is not None:
-                # 將NumPy數組轉換為JPEG格式
                 _, buffer = cv2.imencode('.jpg', latest_frame)
                 frame_bytes = buffer.tobytes()
-                
-                # 返回幀作為多部分響應
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        
-        # 短暫等待，以控制流量
         time.sleep(0.1)
 
 def run_flask_app(port=5000):
@@ -213,7 +228,7 @@ def run_flask_app(port=5000):
 
 def draw_boxes_on_image(image, results, names, resize_ratio=(1.0, 1.0)):
     """
-    在原始圖像上手動繪製邊界框
+    在原始圖像上手動繪製邊界框 (Python 版本)
     
     Args:
         image: 原始圖像
@@ -226,40 +241,22 @@ def draw_boxes_on_image(image, results, names, resize_ratio=(1.0, 1.0)):
     """
     annotated_image = image.copy()
     
-    # 獲取檢測框
     if hasattr(results[0], 'boxes'):
         boxes = results[0].boxes
+        n_boxes = len(boxes)
         
-        # 繪製每個邊界框
-        for i in range(len(boxes)):
-            # 獲取邊界框座標
-            box = boxes[i].xyxy[0].cpu().numpy()  # 確保座標是 numpy 數組
-            x1, y1, x2, y2 = box
-            
-            # 調整比例
-            x1 = int(x1 * resize_ratio[0])
-            x2 = int(x2 * resize_ratio[0])
-            y1 = int(y1 * resize_ratio[1])
-            y2 = int(y2 * resize_ratio[1])
-            
-            # 獲取類別和信心度
+        for i in range(n_boxes):
+            box = boxes[i].xyxy[0].cpu().numpy()
+            x1, y1, x2, y2 = int(box[0] * resize_ratio[0]), int(box[1] * resize_ratio[1]), int(box[2] * resize_ratio[0]), int(box[3] * resize_ratio[1])
             cls_id = int(boxes[i].cls[0].item())
             conf = float(boxes[i].conf[0].item())
-            
-            # 繪製邊界框
-            color = (0, 255, 0)  # 綠色
+            color = (0, 255, 0)
             cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, 2)
-            
-            # 繪製標籤
             label = f"{names[cls_id]} {conf:.2f}"
-            (text_width, text_height), baseline = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2
-            )
-            
-            # 確保標籤在圖像範圍內
+            text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            text_width, text_height = text_size[0]
+            baseline = text_size[1]
             label_y = max(y1, text_height + 10)
-            
-            # 繪製背景和文字
             cv2.rectangle(
                 annotated_image, 
                 (x1, label_y - text_height - baseline), 
@@ -279,20 +276,42 @@ def draw_boxes_on_image(image, results, names, resize_ratio=(1.0, 1.0)):
     
     return annotated_image
 
+def resize_image_for_detection(image, target_size):
+    """圖像縮放函數，適合 Cython 優化"""
+    h, w = image.shape[0], image.shape[1]
+    scale = min(float(target_size) / float(w), float(target_size) / float(h))
+    new_width = int(w * scale)
+    new_height = int(h * scale)
+    resized = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+    return resized, (float(w) / float(new_width), float(h) / float(new_height))
+
+def optimize_for_detection(frame, model, args, use_cython=False):
+    """優化後的偵測處理流程，更適合 Cython"""
+    detection_start = time.time()
+    h, w = frame.shape[0], frame.shape[1]
+    if args.optimize and args.img_size < w:
+        if use_cython:
+            resized_frame, resize_ratio = yolo_cython_utils.resize_image(frame, args.img_size)
+        else:
+            resized_frame, resize_ratio = resize_image_for_detection(frame, args.img_size)
+    else:
+        resized_frame = frame
+        resize_ratio = (1.0, 1.0)
+    results = model(resized_frame, conf=args.conf_thres, verbose=False)
+    detection_time = time.time() - detection_start
+    if args.optimize and args.img_size < w and use_cython:
+        boxes, cls_ids, confs = yolo_cython_utils.extract_detection_data(results[0])
+        annotated_frame = yolo_cython_utils.draw_boxes(frame, boxes, cls_ids, confs, results[0].names, resize_ratio)
+    elif args.optimize and args.img_size < w:
+        annotated_frame = draw_boxes_on_image(frame, results, results[0].names, resize_ratio)
+    else:
+        annotated_frame = results[0].plot()
+    return annotated_frame, detection_time
+
 def main():
     args = parse_args()
+    use_cython = USE_CYTHON
     
-    # 檢查並嘗試導入 Cython 模組
-    try:
-        import yolo_cython_utils
-        print("成功載入 Cython 加速模組")
-        use_cython = True
-    except ImportError:
-        print("警告：無法載入 Cython 加速模組，使用純 Python 模式運行")
-        print("如需更好性能，請運行：python setup.py build_ext --inplace")
-        use_cython = False
-    
-    # 如果沒有指定 --no-streamer 參數，則先啟動 MJPG-Streamer
     if not args.no_streamer:
         print("正在啟動 MJPG-Streamer...")
         if not start_mjpg_streamer(
@@ -303,17 +322,14 @@ def main():
         ):
             print("警告：無法啟動 MJPG-Streamer，將嘗試連接現有串流")
     
-    # 建立輸出目錄
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # 測試串流連線
     print(f"測試串流連線: {args.stream_url}")
     if not test_stream_connection(args.stream_url):
         print("錯誤: 無法連接到 MJPG 串流。請檢查網址和確認 mjpg-streamer 是否正在運行。")
         return
     
-    # 載入 YOLOv11 模型
     try:
         print(f"載入 YOLOv11 模型: {args.model}")
         model, api_type = load_yolo_model(args.model)
@@ -321,22 +337,29 @@ def main():
         print(f"載入模型時發生錯誤: {e}")
         return
     
-    # 啟用 OpenCV 優化
     if args.optimize:
         print("啟用 OpenCV 優化...")
         cv2.setUseOptimized(True)
         print(f"OpenCV 硬體加速已啟用: {cv2.useOptimized()}")
     
-    # 如果啟用網頁界面，在背景執行Flask服務器
     if args.web_interface:
         print(f"啟動網頁界面，訪問 http://[您的IP地址]:{args.flask_port} 查看即時偵測結果")
         flask_thread = threading.Thread(target=run_flask_app, args=(args.flask_port,))
-        flask_thread.daemon = True  # 設置為守護線程，這樣主程序結束時，此線程也會結束
+        flask_thread.daemon = True
         flask_thread.start()
     
-    # 開啟 MJPG 串流
     print(f"連接串流進行處理: {args.stream_url}")
-    cap = cv2.VideoCapture(args.stream_url)
+    
+    # 根據不同情況選擇適合的視頻捕獲方式
+    with cv2_error_suppress:
+        # 不再嘗試使用 Cython 版本的 MJPEG 讀取器，因為可能有編譯問題
+        # 而是使用更健壯的標準 OpenCV VideoCapture
+        cap = cv2.VideoCapture(args.stream_url)
+        
+        # 為 VideoCapture 設置特殊參數以增強 MJPEG 解碼穩定性
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        # 設置較大的緩衝區以應對網絡抖動
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
     
     if not cap.isOpened():
         print("錯誤: OpenCV 無法開啟串流。")
@@ -350,19 +373,19 @@ def main():
     fps = 0
     skip_frame_counter = 0
     
-    global latest_frame  # 引用全局變量
+    global latest_frame
     
     try:
         while True:
-            ret, frame = cap.read()
+            with cv2_error_suppress:
+                ret, frame = cap.read()
             if not ret:
                 print("錯誤: 無法從串流獲取畫面。")
-                time.sleep(1)  # 等待後重試
+                time.sleep(1)
                 continue
             
             frame_count += 1
             
-            # 跳幀處理 - 如果啟用了跳幀且不是處理幀，則跳過偵測
             if args.skip_frames > 0:
                 if skip_frame_counter < args.skip_frames:
                     skip_frame_counter += 1
@@ -371,100 +394,47 @@ def main():
                     continue
                 skip_frame_counter = 0
             
-            # 縮放圖像以加速處理，保持原始寬高比
-            original_shape = frame.shape
-            if args.optimize and args.img_size < frame.shape[1]:
-                # 使用 Cython 或純 Python 進行圖像縮放
-                if use_cython:
-                    resized_frame, resize_ratio = yolo_cython_utils.resize_image(frame, args.img_size)
-                else:
-                    # 原始 Python 縮放圖像邏輯
-                    h, w = frame.shape[:2]
-                    scale = min(args.img_size / w, args.img_size / h)
-                    new_width = int(w * scale)
-                    new_height = int(h * scale)
-                    resized_frame = cv2.resize(frame, (new_width, new_height), 
-                                              interpolation=cv2.INTER_AREA)
-                    resize_ratio = (w / new_width, h / new_height)
-            else:
-                resized_frame = frame
-                resize_ratio = (1.0, 1.0)
-            
-            # 執行物件偵測
             try:
-                detection_start = time.time()
+                annotated_frame, detection_time = optimize_for_detection(frame, model, args, use_cython)
                 
-                if api_type == "ultralytics":
-                    # 使用指定的圖像尺寸進行推理，並抑制詳細輸出
-                    results = model(resized_frame, conf=args.conf_thres, verbose=False)
-                    
-                    # 計算偵測時間
-                    detection_time = time.time() - detection_start
-                    
-                    # 根據是否使用 Cython 和縮放處理偵測結果
-                    if args.optimize and args.img_size < original_shape[1]:
-                        if use_cython:
-                            # 使用 Cython 提取和繪製邊界框
-                            boxes, cls_ids, confs = yolo_cython_utils.extract_detection_data(results[0])
-                            annotated_frame = yolo_cython_utils.draw_boxes(
-                                frame, boxes, cls_ids, confs, results[0].names, resize_ratio
-                            )
-                        else:
-                            # 使用原來的 Python 函數
-                            annotated_frame = draw_boxes_on_image(
-                                frame, 
-                                results, 
-                                results[0].names, 
-                                resize_ratio
-                            )
-                    else:
-                        # 直接使用模型輸出的繪製結果
-                        annotated_frame = results[0].plot()
-                
-                # 在畫面上加入 FPS 和偵測時間
                 cv2.putText(annotated_frame, f"FPS: {fps:.2f}", (10, 30), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 cv2.putText(annotated_frame, f"Speed: {detection_time*1000:.0f}ms", (10, 60), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 
-                # 如果使用 Cython，則顯示相關信息
                 if use_cython:
                     cv2.putText(annotated_frame, "Cython Accelerated", (10, 90), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2)
                 
                 processed_count += 1
+                
                 if processed_count % 5 == 0:
                     time_diff = time.time() - start_time
-                    if time_diff > 0.001:  # 避免除以非常小的數字
-                        fps = processed_count / time_diff
-                        if not args.quiet:
-                            print(f"處理速度: {fps:.2f} FPS, 偵測時間: {detection_time*1000:.0f}ms")
+                    if time_diff > 0.001:
+                        fps = 5.0 / time_diff
+                    start_time = time.time()
+                    if not args.quiet:
+                        print(f"處理速度: {fps:.2f} FPS, 偵測時間: {detection_time*1000:.0f}ms")
             except Exception as e:
                 print(f"偵測過程中發生錯誤: {e}")
-                import traceback
                 traceback.print_exc()
                 annotated_frame = frame
-                # 加入錯誤文字
                 cv2.putText(annotated_frame, "ERROR", (10, 30), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             
-            # 更新全局變量以供Flask使用
             with frame_lock:
                 latest_frame = annotated_frame.copy()
             
-            # 依指定間隔儲存畫面
             if args.save_interval > 0 and frame_count % args.save_interval == 0:
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
                 output_path = output_dir / f"detection_{timestamp}.jpg"
                 cv2.imwrite(str(output_path), annotated_frame)
                 print(f"已儲存偵測結果至 {output_path}")
             
-            # 如果啟用，儲存最新畫面
             if args.save_latest:
                 latest_path = output_dir / "latest_detection.jpg"
                 cv2.imwrite(str(latest_path), annotated_frame)
                 
-            # 短暫延遲以控制 CPU 使用率
             time.sleep(0.01)
     except KeyboardInterrupt:
         print("使用者中斷偵測")
@@ -472,10 +442,8 @@ def main():
         print(f"發生未預期錯誤: {e}")
     finally:
         cap.release()
-        # 停止 MJPG-Streamer (如果是我們啟動的)
         if not args.no_streamer and is_process_running('mjpg_streamer'):
             try:
-                # 嘗試優雅地結束進程
                 subprocess.run(['pkill', 'mjpg_streamer'], 
                                stdout=subprocess.PIPE, 
                                stderr=subprocess.PIPE)
@@ -485,11 +453,9 @@ def main():
         
         print("串流已關閉")
 
-# 程式結束時的清理函數
 def cleanup(*args):
     print("\n正在結束程式...")
     
-    # 嘗試停止 MJPG-Streamer
     if is_process_running('mjpg_streamer'):
         try:
             subprocess.run(['pkill', 'mjpg_streamer'], 
@@ -499,21 +465,17 @@ def cleanup(*args):
         except:
             pass
     
-    # 使用 os._exit 而不是 sys.exit 來避免可能的異常終止
     os._exit(0)
 
 if __name__ == "__main__":
-    # 註冊信號處理器，以便能夠優雅地關閉程式
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
     
     try:
         main()
     except KeyboardInterrupt:
-        # 確保即使在主程式外也能捕獲中斷
         cleanup()
     except Exception as e:
         print(f"程式發生嚴重錯誤: {e}")
-        import traceback
         traceback.print_exc()
         cleanup()

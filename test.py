@@ -13,6 +13,33 @@ from flask import Flask, Response, render_template
 import io
 import traceback
 
+# 重定向 stderr 以抑制 OpenCV 的錯誤訊息
+class SuppressOutput:
+    def __init__(self, suppress_stderr=True, suppress_stdout=False):
+        self.suppress_stderr = suppress_stderr
+        self.suppress_stdout = suppress_stdout
+        self._stderr = None
+        self._stdout = None
+
+    def __enter__(self):
+        if self.suppress_stderr:
+            self._stderr = sys.stderr
+            sys.stderr = open(os.devnull, 'w')
+        if self.suppress_stdout:
+            self._stdout = sys.stdout
+            sys.stdout = open(os.devnull, 'w')
+
+    def __exit__(self, *args):
+        if self.suppress_stderr and self._stderr:
+            sys.stderr.close()
+            sys.stderr = self._stderr
+        if self.suppress_stdout and self._stdout:
+            sys.stdout.close()
+            sys.stdout = self._stdout
+
+# 抑制 OpenCV 錯誤訊息
+cv2_error_suppress = SuppressOutput(suppress_stderr=True)
+
 # 導入 Cython 優化模組
 try:
     import yolo_cython_utils
@@ -322,7 +349,17 @@ def main():
         flask_thread.start()
     
     print(f"連接串流進行處理: {args.stream_url}")
-    cap = cv2.VideoCapture(args.stream_url)
+    
+    # 根據不同情況選擇適合的視頻捕獲方式
+    with cv2_error_suppress:
+        # 不再嘗試使用 Cython 版本的 MJPEG 讀取器，因為可能有編譯問題
+        # 而是使用更健壯的標準 OpenCV VideoCapture
+        cap = cv2.VideoCapture(args.stream_url)
+        
+        # 為 VideoCapture 設置特殊參數以增強 MJPEG 解碼穩定性
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        # 設置較大的緩衝區以應對網絡抖動
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
     
     if not cap.isOpened():
         print("錯誤: OpenCV 無法開啟串流。")
@@ -340,7 +377,8 @@ def main():
     
     try:
         while True:
-            ret, frame = cap.read()
+            with cv2_error_suppress:
+                ret, frame = cap.read()
             if not ret:
                 print("錯誤: 無法從串流獲取畫面。")
                 time.sleep(1)
